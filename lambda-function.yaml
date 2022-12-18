@@ -1,0 +1,71 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: AWS CloudFormation Template for sample AWS Lambda
+Parameters:
+  Environment:
+    Description: what environment we are deploying
+    Type: String
+    Default: dev
+
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaFunctionPolicy
+      Roles:
+      - !Ref 'LambdaRole'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource:
+          - arn:aws:logs:*:*:*
+        - Effect: Allow
+          Action:
+          - logs:*
+          Resource:
+          - '*'
+
+  SampleLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - LambdaPolicy
+    Properties:
+      Code:
+        ZipFile: |
+          def handler(event, context):
+            println('Hello lambda ...')
+            return True
+      Description: "Sample lambda function for testing"
+      FunctionName: sample-lambda
+      Handler: "index.handler"
+      Role: !GetAtt [LambdaRole, Arn]
+      Runtime: python3.9
+      Timeout: 10
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: "Environment"
+          Value: !Ref 'Environment'
+
+Outputs:
+  SampleLambdaFunction:
+    Value: !GetAtt [SampleLambdaFunction, Arn]
