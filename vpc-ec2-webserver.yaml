@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  KeyPair:
+    Description: Keypair
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: 'nginx-test'
+  LinuxAMI:
+    Description: Amazon Linux AMI ID
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2'
+  VpcBlock:
+    Type: String
+    Default: 10.10.0.0/16
+    Description: CIDR range for the VPC. This should be a valid private (RFC 1918) CIDR range.
+  PublicSubnetBlock:
+    Type: String
+    Default: 10.10.50.0/24
+    Description: CIDR range for Public Subnet
+  YourIPRange:
+    Type: String
+    Description: CIDR range of the network from where you will SSH to the Master server
+    MinLength: 9
+    MaxLength: 18
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x
+    Default: '0.0.0.0/0'
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:  !Ref VpcBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-VPC'
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+  VPCGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: Public Subnets
+      - Key: Network
+        Value: Public
+  PublicRoute:
+    DependsOn: VPCGatewayAttachment
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - '0'
+        - Fn::GetAZs: !Ref AWS::Region
+      CidrBlock: !Ref PublicSubnetBlock
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub "${AWS::StackName}-PublicSubnet"
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  NginxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Nginx Server Security Group - Allow SSH access from your IP range
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: !Ref YourIPRange
+        Description: SSH from your IP
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+        Description: HTTP to Internet
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+        Description: SSH to Anywhere
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+        Description: HTTP to Internet
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: 'AllowSecretsManagerRead'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:Create*
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - s3:GetObject
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+  CloudWatchServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref 'CloudWatchAgentRole'
+  NginxServer:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment1: Installing NGINX Server
+      AWS::CloudFormation::Init:
+          config:
+            packages:
+              yum:
+                httpd: []
+                php: []
+            files:
+              "/tmp/cwlogs/apacheaccess.conf":
+                content: !Sub |
+                  [general]
+                  state_file= /var/awslogs/agent-state
+                  [/var/log/httpd/access_log]
+                  file = /var/log/httpd/access_log
+                  log_group_name = ${WebServerLogGroup}
+                  log_stream_name = {instance_id}/apache.log
+                  datetime_format = %d/%b/%Y:%H:%M:%S
+                mode: '000400'
+                owner: apache
+                group: apache
+              "/var/www/html/index.php":
+                content: !Sub |
+                  "<?php"
+                  "echo '<h1>AWS CloudFormation sample PHP application</h1>';"
+                  "?>"
+                mode: '000644'
+                owner: apache
+                group: apache
+              "/etc/cfn/cfn-hup.conf":
+                content: !Sub |
+                  [main]
+                  stack= ${AWS::StackId}
+                  region=${AWS::Region}
+                mode: "000400"
+                owner: "root"
+                group: "root"
+              "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+                content: !Sub |
+                  [cfn-auto-reloader-hook]
+                  triggers=post.update
+                  path=Resources.WebServerHost.Metadata.AWS::CloudFormation::Init
+                  action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource WebServerHost --region ${AWS::Region}
+                mode: "000400"
+                owner: "root"
+                group: "root"
+            services:
+              sysvinit:
+                httpd:
+                  enabled: 'true'
+                  ensureRunning: 'true'
+                sendmail:
+                  enabled: 'false'
+                  ensureRunning: 'false'
+      CreationPolicy:
+        ResourceSignal:
+          Timeout: PT5M
+    Properties:
+      ImageId: !Ref 'LinuxAMI'
+      KeyName: !Ref 'KeyPair'
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref CloudWatchServerInstanceProfile
+      Tags:
+      - Key: 'Name'
+        Value: 'NginxServer'
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: 'true'
+        DeviceIndex: '0'
+        GroupSet:
+        - !Ref 'NginxSecurityGroup'
+        SubnetId: !Ref 'PublicSubnet'
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -xe
+            # Get the latest CloudFormation package
+            yum update -y aws-cfn-bootstrap
+            # Start cfn-init
+            /opt/aws/bin/cfn-init -s ${AWS::StackId} -r WebServerHost --region ${AWS::Region} || error_exit 'Failed to run cfn-init'
+            # Start up the cfn-hup daemon to listen for changes to the EC2 instance metadata
+            /opt/aws/bin/cfn-hup || error_exit 'Failed to start cfn-hup'
+            # Get the CloudWatch Logs agent
+            wget https://s3.amazonaws.com/aws-cloudwatch/downloads/latest/awslogs-agent-setup.py
+            # Install the CloudWatch Logs agent
+            python awslogs-agent-setup.py -n -r ${AWS::Region} -c /tmp/cwlogs/apacheaccess.conf || error_exit 'Failed to run CloudWatch Logs agent setup'
+            # All done so signal success
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource WebServerHost --region ${AWS::Region}
+  
+  WebServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+  
+  4xxMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName:
+        Ref: WebServerLogGroup
+      FilterPattern: "[ip, identity, user_id, timestamp, request, status_code = 4*, size, ...]"
+      MetricTransformations:
+      - MetricValue: '1'
+        MetricNamespace: test/4xxs
+        MetricName: test4xxCount
+  
+  UnauthorizedApiMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+        FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+        LogGroupName: !Ref WebServerLogGroup
+        MetricTransformations:
+            - MetricValue: "1"
+              MetricNamespace: test/error
+              MetricName: UnauthorizedApiCallsMetric
+
+  BytesTransferredMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName:
+        Ref: WebServerLogGroup
+      FilterPattern: "[ip, identity, user_id, timestamp, request, status_code, size, ...]"
+      MetricTransformations:
+      - MetricValue: "$size"
+        MetricNamespace: test/BytesTransferred
+        MetricName: testBytesTransferred
+  
+  4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The number of 4xxs is greater than 10 over a configurable time frame in minutes
+      MetricName: test4xxCount
+      Namespace: test/4xxs
+      Statistic: Sum
+      Period: '60'
+      EvaluationPeriods: '1'
+      Threshold: '10'
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+      ComparisonOperator: GreaterThanThreshold
+  
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: CloudwatchMetricsAlaram
+      Subscription:
+        - Endpoint: 'kamireddy777@gmail.com'
+          Protocol: email
+      Tags:
+        - Key: name
+          Value: WeserverMetrics
+  
+  UnauthorizedApiAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+        ActionsEnabled: True 
+        AlarmActions: 
+            - Ref: AlarmNotificationTopic
+        AlarmDescription: Alarms on unauthorized API calls - CIS Benchmark 3.1
+        AlarmName: UnauthorizedApiCallsAlarm
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        EvaluationPeriods: 1
+        MetricName: UnauthorizedApiCallsMetric
+        Namespace: test/error
+        Period: 300
+        Statistic: Sum
+        Threshold: 20
+        TreatMissingData: missing
+
+Outputs:
+  NginxServerPublicIP:
+    Description: Master Server Public IP
+    Value: !GetAtt 'NginxServer.PublicIp'
+  NginxSecurityGroup:
+    Description: Master Security Group ID
+    Value: !Ref NginxSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NginxSecurityGroup'

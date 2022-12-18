@@ -7,7 +7,14 @@ Parameters:
     Description: what environment we are deploying
     Type: String
     Default: dev
-
+  EventState:
+    Description: Whether Cloudwatch event schedule is enabled or disabled
+    Type: String
+    Default: ENABLED
+  AlarmIdentifierPrefix:
+    Description: Enter the prefix that should be added to the beginning of each alarm created by the solution, (e.g. AutoAlarm-i-00e4f327736cb077f-CPUUtilization-GreaterThanThreshold-80-5m)
+    Type: String
+    Default: AutoAlarm
 
 Resources:
   LambdaRole:
@@ -33,16 +40,40 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-        - Effect: Allow
-          Action:
-          - logs:*
-          Resource:
-          - arn:aws:logs:*:*:*
-        - Effect: Allow
-          Action:
-          - logs:*
-          Resource:
-          - '*'
+          - Effect: Allow
+            Action:
+              - cloudwatch:PutMetricData
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+          - Effect: Allow
+            Action:
+              - logs:PutLogEvents
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:log-stream:*"
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeImages
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+            Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+          - Effect: Allow
+            Action:
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:PutMetricAlarm
+            Resource: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AlarmIdentifierPrefix}-*"
+          - Effect: Allow
+            Action:
+              - cloudwatch:DescribeAlarms
+            Resource: "*"
 
   SampleLambdaFunction:
     Type: AWS::Lambda::Function
@@ -52,7 +83,7 @@ Resources:
       Code:
         ZipFile: |
           def handler(event, context):
-            println('Hello lambda ...')
+            print('Hello lambda ...')
             return True
       Description: "Sample lambda function for testing"
       FunctionName: sample-lambda
@@ -66,6 +97,72 @@ Resources:
         - Key: "Environment"
           Value: !Ref 'Environment'
 
+  CloudWatchAutoAlarmCloudwatchEventEC2:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Initiate-CloudWatchAutoAlarmsEC2
+      Description: Creates CloudWatch alarms on instance start via Lambda CloudWatchAutoAlarms and deletes them on instance termination.
+      EventPattern: '
+        {
+          "source": [
+            "aws.ec2"
+          ],
+          "detail-type": [
+            "EC2 Instance State-change Notification"
+          ],
+          "detail": {
+            "state": [
+              "running",
+              "terminated"
+            ]
+          }
+        }'
+      State: !Ref EventState
+      Targets:
+        - Arn: !GetAtt SampleLambdaFunction.Arn
+          Id: LATEST
+  
+  CloudWatchAutoAlarmCloudwatchEventLambda:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: Initiate-CloudWatchAutoAlarmsLambda
+      Description: Creates CloudWatch alarms on for lambda functions with the CloudWatchAutoAlarms activation tag
+      EventPattern: '
+        {
+          "source": [
+            "aws.lambda"
+          ],
+          "detail-type": [
+            "AWS API Call via CloudTrail"
+          ],
+          "detail": {
+            "eventSource": [
+              "lambda.amazonaws.com"
+            ],
+            "eventName": [
+              "TagResource20170331v2",
+              "DeleteFunction20150331"
+            ]
+          }
+        }
+        '
+      State: !Ref EventState
+      Targets:
+        - Arn: !GetAtt SampleLambdaFunction.Arn
+          Id: LATEST
+          
+  LambdaInvokePermissionCloudwatchEventsLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt
+        - SampleLambdaFunction
+        - Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt
+        - CloudWatchAutoAlarmCloudwatchEventLambda
+        - Arn
+  
 Outputs:
   SampleLambdaFunction:
     Value: !GetAtt [SampleLambdaFunction, Arn]

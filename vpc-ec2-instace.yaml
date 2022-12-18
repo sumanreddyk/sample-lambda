@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  KeyPair:
+    Description: Keypair
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: 'nginx-test'
+  LinuxAMI:
+    Description: Amazon Linux AMI ID
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn-ami-hvm-x86_64-gp2'
+  VpcBlock:
+    Type: String
+    Default: 10.10.0.0/16
+    Description: CIDR range for the VPC. This should be a valid private (RFC 1918) CIDR range.
+  PublicSubnetBlock:
+    Type: String
+    Default: 10.10.50.0/24
+    Description: CIDR range for Public Subnet
+  YourIPRange:
+    Type: String
+    Description: CIDR range of the network from where you will SSH to the Master server
+    MinLength: 9
+    MaxLength: 18
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x
+    Default: '0.0.0.0/0'
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:  !Ref VpcBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-VPC'
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+  VPCGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: Public Subnets
+      - Key: Network
+        Value: Public
+  PublicRoute:
+    DependsOn: VPCGatewayAttachment
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+        - '0'
+        - Fn::GetAZs: !Ref AWS::Region
+      CidrBlock: !Ref PublicSubnetBlock
+      VpcId: !Ref VPC
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub "${AWS::StackName}-PublicSubnet"
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  NginxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Nginx Server Security Group - Allow SSH access from your IP range
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: !Ref YourIPRange
+        Description: SSH from your IP
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+        Description: HTTP to Internet
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 0.0.0.0/0
+        Description: SSH to Anywhere
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+        Description: HTTP to Internet
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: 'AllowSecretsManagerRead'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+  CloudWatchServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref 'CloudWatchAgentRole'
+  NginxServer:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment1: Installing NGINX Server
+    Properties:
+      ImageId: !Ref 'LinuxAMI'
+      KeyName: !Ref 'KeyPair'
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref CloudWatchServerInstanceProfile
+      Tags:
+      - Key: 'Name'
+        Value: 'NginxServer'
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: 'true'
+        DeviceIndex: '0'
+        GroupSet:
+        - !Ref 'NginxSecurityGroup'
+        SubnetId: !Ref 'PublicSubnet'
+      UserData: !Base64
+        Fn::Join:
+        - ''
+        - - '#!/bin/bash -xe
+
+            '
+          - 'sudo yum install epel-release
+
+            '
+          - 'sudo yum update
+
+            '
+          - 'sudo yum install nginx -y
+
+            '
+          - 'sudo nginx -v
+
+            '
+          - 'sudo nginx
+          
+            '
+          - 'curl -I 127.0.0.1
+
+            '
+          - 'sudo yum install awslogs -y
+          
+            '
+          - 'service awslogs start
+          
+            '
+
+  UnauthorizedApiMetricFilter:
+        Type: AWS::Logs::MetricFilter
+        Properties:
+            FilterPattern: '{ ($.errorCode = "*UnauthorizedOperation") || ($.errorCode = "AccessDenied*") }'
+            LogGroupName: !Ref CloudTrailLogGroupName
+            MetricTransformations:
+                - 
+                    MetricValue: "1"
+                    MetricNamespace: !Ref Namespace
+                    MetricName: UnauthorizedApiCallsMetric
+    UnauthorizedApiAlarm:
+        Type: AWS::CloudWatch::Alarm
+        Properties:
+            ActionsEnabled: True 
+            AlarmActions: 
+                - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SnsTopicName}'
+            AlarmDescription: Alarms on unauthorized API calls - CIS Benchmark 3.1
+            AlarmName: UnauthorizedApiCallsAlarm
+            ComparisonOperator: GreaterThanOrEqualToThreshold
+            EvaluationPeriods: 1
+            MetricName: UnauthorizedApiCallsMetric
+            Namespace: !Ref Namespace
+            Period: 300
+            Statistic: Sum
+            Threshold: 20
+            TreatMissingData: missing
+Outputs:
+  NginxServerPublicIP:
+    Description: Master Server Public IP
+    Value: !GetAtt 'NginxServer.PublicIp'
+  NginxSecurityGroup:
+    Description: Master Security Group ID
+    Value: !Ref NginxSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-NginxSecurityGroup'
